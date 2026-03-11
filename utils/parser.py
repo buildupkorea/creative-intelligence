@@ -1,172 +1,277 @@
 """
-Excel Parser — 캠페인 리포트 엑셀을 자동 파싱
-센카/UNO 등 다양한 형식 지원
+parser.py — SENKA/UNO 리포트 엑셀 파싱 모듈
+엑셀 구조를 자동 감지하여 소재별 성과 데이터를 추출합니다.
 """
-
 import pandas as pd
 import openpyxl
-from io import BytesIO
+from typing import Dict, List, Optional, Tuple
+import re
 
 
-def parse_excel(uploaded_file):
-    """Parse campaign report Excel file"""
-    wb = openpyxl.load_workbook(BytesIO(uploaded_file.read()), data_only=True)
-    uploaded_file.seek(0)  # Reset for image extraction
+def parse_report(file) -> Dict:
+    """메인 파싱 함수: 엑셀 파일을 받아 구조화된 데이터를 반환"""
+    wb = openpyxl.load_workbook(file, data_only=True)
     
     result = {
-        'client': '',
-        'campaign': '',
-        'period': '',
-        'budget': 0,
-        'creatives': [],
-        'media': [],
-        'daily': [],
+        "meta": parse_summary(wb),
+        "creatives": parse_creatives(wb),
+        "daily": parse_daily(wb),
+        "media_detail": parse_media_detail(wb),
     }
     
-    # ===== Parse Summary Sheet =====
-    if 'Summary' in wb.sheetnames:
-        ws = wb['Summary']
-        result['client'] = str(ws['C2'].value or '')
-        result['campaign'] = str(ws['C3'].value or '')
-        result['period'] = str(ws['C4'].value or '')
-        result['budget'] = float(ws['C5'].value or 0)
-    
-    # ===== Parse Creative Sheet =====
-    if 'Creative' in wb.sheetnames:
-        ws = wb['Creative']
-        result['creatives'] = parse_creative_sheet(ws)
-    
-    # ===== Parse Media Data from Summary =====
-    if 'Summary' in wb.sheetnames:
-        result['media'] = parse_media_from_summary(wb['Summary'])
-    
-    # ===== Parse Daily Sheet =====
-    if 'Daily' in wb.sheetnames:
-        result['daily'] = parse_daily_sheet(wb['Daily'])
-    
-    wb.close()
     return result
 
 
-def parse_creative_sheet(ws):
-    """Parse the Creative sheet for ad performance data"""
-    creatives = []
+def parse_summary(wb) -> Dict:
+    """Summary 시트에서 캠페인 메타 정보 추출"""
+    if "Summary" not in wb.sheetnames:
+        return {}
     
-    # Find the META(전환) section - usually starts around row 24
-    header_row = None
-    for row in range(1, ws.max_row + 1):
-        cell_b = ws.cell(row, 2).value
-        cell_c = ws.cell(row, 3).value
-        if cell_b == 'MEDIA' and cell_c == '시안':
-            header_row = row
+    ws = wb["Summary"]
+    meta = {}
+    
+    # 기본 정보 (B2~B6 영역)
+    field_map = {
+        "Client": "client",
+        "Campaign": "campaign", 
+        "Reporting Period": "period",
+        "Campaign Budget": "budget",
+        "Site": "site",
+    }
+    
+    for row in ws.iter_rows(min_row=1, max_row=10, min_col=2, max_col=7, values_only=False):
+        for cell in row:
+            if cell.value and str(cell.value).strip() in field_map:
+                key = field_map[str(cell.value).strip()]
+                # C열에서 값 가져오기
+                val_cell = ws.cell(row=cell.row, column=cell.column + 1)
+                meta[key] = val_cell.value
+    
+    # Total 성과 지표 (B16 행)
+    meta["total_performance"] = {}
+    for row in ws.iter_rows(min_row=10, max_row=40, values_only=False):
+        row_vals = {c.column: c.value for c in row if c.value is not None}
+        if 2 in row_vals and row_vals[2] == "TOTAL":
+            meta["total_performance"] = {
+                "impressions": row_vals.get(5, 0),
+                "clicks": row_vals.get(8, 0),
+                "actions": row_vals.get(11, 0),
+                "ctr": row_vals.get(14, 0),
+                "spent_budget": row_vals.get(16, 0),
+                "cpm": row_vals.get(19, 0),
+                "cpc": row_vals.get(21, 0),
+            }
             break
     
-    if not header_row:
-        # Try alternate format
-        for row in range(1, ws.max_row + 1):
-            if ws.cell(row, 6).value == 'Imps' and ws.cell(row, 7).value == 'Clicks':
-                header_row = row
-                break
+    # 제품별 소계 파싱
+    products = {}
+    current_product = None
+    for row in ws.iter_rows(min_row=17, max_row=50, values_only=False):
+        row_dict = {c.column: c.value for c in row if c.value is not None}
+        # 제품명 행 감지 (B열에 제품명만 있는 행)
+        if 2 in row_dict and len(row_dict) <= 2 and isinstance(row_dict[2], str):
+            current_product = row_dict[2]
+            products[current_product] = {}
+        # TOTAL 행 감지
+        if 2 in row_dict and row_dict[2] == "TOTAL" and current_product:
+            products[current_product] = {
+                "impressions": row_dict.get(5, 0),
+                "clicks": row_dict.get(8, 0),
+                "actions": row_dict.get(11, 0),
+                "spent_budget": row_dict.get(16, 0),
+            }
     
-    if not header_row:
-        return creatives
+    meta["products"] = products
+    return meta
+
+
+def parse_creatives(wb) -> List[Dict]:
+    """Creative 시트에서 소재별 성과 데이터 추출"""
+    if "Creative" not in wb.sheetnames:
+        return []
     
-    # Parse rows after header
-    current_media = ''
-    current_product = ''
+    ws = wb["Creative"]
+    creatives = []
     
-    for row in range(header_row + 1, ws.max_row + 1):
-        b_val = ws.cell(row, 2).value
-        c_val = ws.cell(row, 3).value
-        d_val = ws.cell(row, 4).value
-        f_val = ws.cell(row, 6).value  # Imps
+    # META(전환_구매) 소재 파싱 (B24~ 영역)
+    current_media = None
+    current_product = None
+    
+    for row_idx in range(24, ws.max_row + 1):
+        row = {}
+        for col_idx in range(2, 21):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if cell.value is not None:
+                row[col_idx] = cell.value
         
-        # Check for media label
-        if b_val and 'META' in str(b_val):
-            current_media = str(b_val)
-        if b_val and ('TOTAL' in str(b_val) or 'Grand' in str(b_val)):
+        if not row:
             continue
         
-        # Check for product label
-        if c_val and not d_val:
-            current_product = str(c_val)
-            continue
-        if c_val and d_val:
-            current_product = str(c_val)
+        # MEDIA 헤더 감지 (B열)
+        if 2 in row and isinstance(row[2], str):
+            val = str(row[2]).strip()
+            if val.startswith("META") or val.startswith("구글") or val == "Grand TOTAL" or val == "SUB TOTAL":
+                current_media = val
+                if current_media in ("Grand TOTAL", "SUB TOTAL"):
+                    continue
         
-        # Parse creative data
-        if d_val and f_val and isinstance(f_val, (int, float)) and f_val > 0:
+        # 제품명 감지 (C열)
+        if 3 in row and isinstance(row[3], str) and row[3].strip():
+            current_product = row[3].strip()
+        
+        # 소재 데이터 행 (D열에 "N안" 패턴)
+        if 4 in row and isinstance(row[4], str):
+            name = str(row[4]).strip()
+            if not name:
+                continue
+            
             creative = {
-                'media': current_media,
-                'product': current_product,
-                'name': str(d_val),
-                'imps': float(f_val or 0),
-                'clicks': float(ws.cell(row, 7).value or 0),
-                'action': float(ws.cell(row, 8).value or 0),
-                'rev': float(ws.cell(row, 9).value or 0),
-                'cvr': float(ws.cell(row, 10).value or 0),
-                'ctr': float(ws.cell(row, 11).value or 0),
-                'cpm': float(ws.cell(row, 12).value or 0),
-                'cpc': float(ws.cell(row, 13).value or 0),
-                'cpa': float(ws.cell(row, 14).value or 0),
-                'roas': float(ws.cell(row, 15).value or 0),
-                'cost': float(ws.cell(row, 16).value or 0),
-                'note': str(ws.cell(row, 17).value or ''),
+                "media": current_media or "",
+                "product": current_product or "",
+                "name": name,
+                "impressions": _safe_num(row.get(6)),
+                "clicks": _safe_num(row.get(7)),
+                "actions": _safe_num(row.get(8)),
+                "revenue": _safe_num(row.get(9)),
+                "cvr": _safe_num(row.get(10)),
+                "ctr": _safe_num(row.get(11)),
+                "cpm": _safe_num(row.get(12)),
+                "cpc": _safe_num(row.get(13)),
+                "cpa": _safe_num(row.get(14)),
+                "roas": _safe_num(row.get(15)),
+                "spent": _safe_num(row.get(16)),
+                "note": str(row.get(17, "")) if row.get(17) else "",
             }
             
-            # Handle #DIV/0! and other errors
-            for key in ['cvr', 'ctr', 'cpm', 'cpc', 'cpa', 'roas']:
-                if isinstance(creative[key], str) or creative[key] is None:
-                    creative[key] = 0
+            # 소재 유형 판별 (이미지/영상/카탈로그)
+            if "이미지" in name:
+                creative["format"] = "이미지"
+            elif "영상" in name:
+                creative["format"] = "영상"
+            elif "카탈로그" in name:
+                creative["format"] = "카탈로그"
+            elif "디멘드젠" in name or "디맨드젠" in name:
+                creative["format"] = "디멘드젠"
+            else:
+                creative["format"] = "기타"
             
             creatives.append(creative)
     
     return creatives
 
 
-def parse_media_from_summary(ws):
-    """Parse media-level data from Summary sheet"""
-    media = []
+def parse_daily(wb) -> pd.DataFrame:
+    """Daily 시트에서 일별 성과 데이터 추출"""
+    if "Daily" not in wb.sheetnames:
+        return pd.DataFrame()
     
-    # Look for the TOTAL row (usually row 15)
-    for row in range(10, min(40, ws.max_row + 1)):
-        b_val = ws.cell(row, 2).value
-        c_val = ws.cell(row, 3).value
+    ws = wb["Daily"]
+    rows = []
+    
+    for row_idx in range(13, ws.max_row + 1):
+        date_cell = ws.cell(row=row_idx, column=2).value
+        if date_cell is None:
+            continue
         
-        if b_val and 'META' in str(b_val) and c_val:
-            m = {
-                'name': f"{b_val} ({c_val})",
-                'imps': float(ws.cell(row, 5).value or 0),
-                'clicks': float(ws.cell(row, 8).value or 0),
-                'action': float(ws.cell(row, 14).value or 0),
-                'ctr': float(ws.cell(row, 17).value or 0),
-                'cost': float(ws.cell(row, 19).value or 0),
-                'cpc': 0,
-            }
-            if m['clicks'] > 0:
-                m['cpc'] = m['cost'] / m['clicks']
-            media.append(m)
+        row = {
+            "date": date_cell,
+            "day_of_week": ws.cell(row=row_idx, column=3).value,
+            # Total
+            "total_imps": _safe_num(ws.cell(row=row_idx, column=4).value),
+            "total_clicks": _safe_num(ws.cell(row=row_idx, column=5).value),
+            "total_actions": _safe_num(ws.cell(row=row_idx, column=6).value),
+            "total_ctr": _safe_num(ws.cell(row=row_idx, column=7).value),
+            "total_cost": _safe_num(ws.cell(row=row_idx, column=11).value),
+            # META 전환
+            "meta_conv_imps": _safe_num(ws.cell(row=row_idx, column=15).value),
+            "meta_conv_clicks": _safe_num(ws.cell(row=row_idx, column=16).value),
+            "meta_conv_actions": _safe_num(ws.cell(row=row_idx, column=17).value),
+            "meta_conv_cost": _safe_num(ws.cell(row=row_idx, column=22).value),
+            # META 트래픽
+            "meta_traffic_imps": _safe_num(ws.cell(row=row_idx, column=23).value),
+            "meta_traffic_clicks": _safe_num(ws.cell(row=row_idx, column=24).value),
+            "meta_traffic_cost": _safe_num(ws.cell(row=row_idx, column=30).value),
+            # 구글
+            "google_imps": _safe_num(ws.cell(row=row_idx, column=31).value),
+            "google_clicks": _safe_num(ws.cell(row=row_idx, column=32).value),
+            "google_cost": _safe_num(ws.cell(row=row_idx, column=36).value),
+        }
+        rows.append(row)
     
-    return media
+    df = pd.DataFrame(rows)
+    if not df.empty and "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+    return df
 
 
-def parse_daily_sheet(ws):
-    """Parse daily data"""
-    daily = []
+def parse_media_detail(wb) -> Dict:
+    """META(전환), META(트래픽), 구글 시트에서 제품별 일별 상세 추출"""
+    detail = {}
     
-    # Find the daily data rows (look for date values)
-    for row in range(10, min(30, ws.max_row + 1)):
-        b_val = ws.cell(row, 2).value
-        d_val = ws.cell(row, 4).value  # Total imps
-        
-        if b_val and hasattr(b_val, 'strftime') and d_val and isinstance(d_val, (int, float)):
-            daily.append({
-                'date': b_val.strftime('%m/%d'),
-                'day': str(ws.cell(row, 3).value or ''),
-                'imps': float(d_val or 0),
-                'clicks': float(ws.cell(row, 5).value or 0),
-                'action': float(ws.cell(row, 6).value or 0),
-                'cost': float(ws.cell(row, 11).value or 0),
-            })
+    # META(전환) 시트 — 제품별 daily
+    if "META(전환)" in wb.sheetnames:
+        ws = wb["META(전환)"]
+        detail["meta_conversion"] = _parse_media_sheet_daily(ws)
     
-    return daily
+    if "META(트래픽)" in wb.sheetnames:
+        ws = wb["META(트래픽)"]
+        detail["meta_traffic"] = _parse_media_sheet_daily(ws)
+    
+    return detail
+
+
+def _parse_media_sheet_daily(ws) -> Dict:
+    """매체 시트에서 Total 성과 + 일별 데이터 추출"""
+    result = {
+        "total": {},
+        "daily": [],
+    }
+    
+    # Total (row 9)
+    result["total"] = {
+        "impressions": _safe_num(ws.cell(row=9, column=4).value),
+        "clicks": _safe_num(ws.cell(row=9, column=5).value),
+        "actions": _safe_num(ws.cell(row=9, column=6).value),
+        "revenue": _safe_num(ws.cell(row=9, column=7).value),
+        "ctr": _safe_num(ws.cell(row=9, column=8).value),
+        "cvr": _safe_num(ws.cell(row=9, column=9).value),
+        "roas": _safe_num(ws.cell(row=9, column=10).value),
+    }
+    
+    # Daily (row 17~)
+    for row_idx in range(17, ws.max_row + 1):
+        date_val = ws.cell(row=row_idx, column=2).value
+        if date_val is None:
+            continue
+        row = {
+            "date": date_val,
+            "impressions": _safe_num(ws.cell(row=row_idx, column=4).value),
+            "clicks": _safe_num(ws.cell(row=row_idx, column=5).value),
+            "actions": _safe_num(ws.cell(row=row_idx, column=6).value),
+            "revenue": _safe_num(ws.cell(row=row_idx, column=7).value),
+            "ctr": _safe_num(ws.cell(row=row_idx, column=8).value),
+            "cvr": _safe_num(ws.cell(row=row_idx, column=9).value),
+            "roas": _safe_num(ws.cell(row=row_idx, column=10).value),
+            "cost": _safe_num(ws.cell(row=row_idx, column=14).value),
+        }
+        result["daily"].append(row)
+    
+    return result
+
+
+def _safe_num(val) -> float:
+    """안전한 숫자 변환"""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        val = val.strip().replace(",", "").replace("%", "")
+        if val in ("#DIV/0!", "#REF!", "#N/A", "", "-"):
+            return 0.0
+        try:
+            return float(val)
+        except ValueError:
+            return 0.0
+    return 0.0
