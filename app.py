@@ -1,6 +1,6 @@
 """
 Creative Intelligence — Streamlit Dashboard
-엑셀 업로드 → 자동 파싱 → v5 수준 인터랙티브 대시보드 + HTML 다운로드
+엑셀 업로드 → 자동 파싱 → v5 수준 인터랙티브 대시보드 + HTML 다운로드 
 """
 import streamlit as st
 import pandas as pd
