@@ -142,15 +142,15 @@ images = extract_images(uploaded_file)
 if "tags" not in st.session_state:
     st.session_state.tags = {}
 
-for c in creatives:
-    key = f"{c['product']}_{c['name']}"
-    if key not in st.session_state.tags:
-        st.session_state.tags[key] = get_default_tags()
+# 고유 키 생성 (idx 포함하여 중복 방지)
+for idx, c in enumerate(creatives):
+    c["_key"] = f"{idx}_{c['media'][:10]}_{c['product']}_{c['name']}"
+    if c["_key"] not in st.session_state.tags:
+        st.session_state.tags[c["_key"]] = get_default_tags()
 
 # 태깅 데이터를 creatives에 머지
 for c in creatives:
-    key = f"{c['product']}_{c['name']}"
-    tags = st.session_state.tags.get(key, {})
+    tags = st.session_state.tags.get(c["_key"], {})
     for attr_key in ATTRIBUTE_SCHEMA:
         c[attr_key] = tags.get(attr_key, "")
 
@@ -317,7 +317,7 @@ with tabs[2]:
     filtered = creatives if media_filter == "전체" else [c for c in creatives if c.get("media") == media_filter]
 
     for idx, c in enumerate(filtered):
-        ckey = f"{c['product']}_{c['name']}"
+        ckey = c["_key"]
         current_tags = st.session_state.tags.get(ckey, get_default_tags())
         filled_count = sum(1 for v in current_tags.values() if v)
         total_count = len(ATTRIBUTE_SCHEMA)
@@ -352,7 +352,7 @@ with tabs[2]:
                     schema["label"],
                     options,
                     index=current_idx,
-                    key=f"tag_{ckey}_{attr_key}",
+                    key=f"t_{ckey}_{attr_key}",
                     format_func=lambda x: "(선택)" if x == "" else x,
                 )
                 if new_val != current_tags.get(attr_key, ""):
