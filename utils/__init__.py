@@ -1,1 +1,1 @@
-# Utils package
+# Creative Intelligence Utils
